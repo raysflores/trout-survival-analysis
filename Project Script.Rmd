@@ -1,0 +1,438 @@
+---
+title: "Brown and Brook Trout Survival Analysis"
+subtitle: "STAT 3559 Project Analysis Journal"
+author: "Gianna Gatling, Zane Al-Dalli, Raymond Santiago"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## I. Introduction
+
+Brook and Brown Trout are an ecologically and economically important species in Pennsylvania, as they serve as key indicators of stream health and support the recreational fishing industries across the state. Programs such as stocking have been used to supplement and manage fisheries across the state. Understanding what drives survival time in stocked trout is essential for informing effective and ethical conservation and management strategies.
+
+Our project examines the survival of Brown (*Salmo trutta*) and Brook (*Salvelinus fontinalis*) Trout across five Pennsylvania streams over a 153-day observation period. Fish were tagged and monitored for survival and movement behavior. Our primary research question is: **Which fish-level and stream-level characteristics are associated with trout survival time?**
+
+We used Kaplan-Meier survival estimates and log-rank tests to compare survival between groups. This was followed by Cox Proportional Hazards regression to identify which explanatory variables predict time-to-death.
+
+---
+
+## II. Data Summary
+
+### Data Loading & Preprocessing
+
+```{r load-libraries}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+```
+
+```{r load-data}
+trout_survival <- read.csv("data/troutsurvival_daily.csv", header = TRUE)
+
+trout_survival$order <- factor(trout_survival$order, levels = c(1, 2, 4),
+                               labels = c("low", "medium", "complex"))
+
+trout_survival$death2 <- factor(trout_survival$death2, levels = c(0, 1),
+                                labels = c("No", "Yes"))
+
+trout_survival$stream  <- as.factor(trout_survival$stream)
+trout_survival$species <- as.factor(trout_survival$species)
+
+trout_survival <- trout_survival %>%
+  select(-time1) %>%
+  select(-death)
+
+# Drop the 9 rows missing move_rate
+trout_clean <- trout_survival %>% filter(!is.na(move_rate))
+
+# Numeric event indicator (required for Surv())
+trout_clean$event <- ifelse(trout_clean$death2 == "Yes", 1, 0)
+
+# Log-transformed columns for regression
+trout_clean$log_Wgt       <- log(trout_clean$Wgt)
+trout_clean$log_move_rate <- log(trout_clean$move_rate)
+
+cat("Dimensions after removing NAs:", nrow(trout_clean), "observations,",
+    ncol(trout_clean), "variables\n")
+```
+
+Nine fish (9.1%) were excluded due to missing `move_rate` values, leaving **n = 90** complete observations for analysis.
+
+**Potential Issues:**
+
+- Missing movement data may reflect transmitter malfunction; if missingness is related to fish condition, estimates could be slightly biased.
+- `stream` and `order` are perfectly collinear — each stream corresponds to exactly one order value — so both cannot be included in the same model. We retain `order` for its broader ecological interpretability.
+- `time2` contains values exceeding 153 days (max = 166), suggesting some fish were tracked beyond the nominal study window; these observations are retained as valid.
+
+### Correlation Among Quantitative Predictors
+
+`Lgt` and `Wgt` are highly correlated (r ≈ 0.90), confirming both cannot be in the same model. We retain `log_Wgt` and exclude `Lgt`. The remaining predictors show low pairwise correlations.
+
+```{r correlation-raw}
+num_vars <- trout_clean[, c("Lgt", "Wgt", "move_rate", "cumdrain")]
+cor(num_vars, use = "complete.obs")
+```
+
+---
+
+## III. Exploratory Data Analysis
+
+### Response Variable: Survival Time (`time2`)
+
+```{r response-summary}
+summary_stats <- trout_clean %>%
+  summarise(
+    Min    = min(time2),
+    Q1     = quantile(time2, 0.25),
+    Median = median(time2),
+    Mean   = round(mean(time2), 1),
+    Q3     = quantile(time2, 0.75),
+    Max    = max(time2),
+    SD     = round(sd(time2), 1)
+  )
+
+kable(summary_stats, caption = "Summary Statistics: Survival Time (days)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r response-hist}
+ggplot(trout_clean, aes(x = time2)) +
+  geom_histogram(bins = 20, fill = "#2c7bb6", color = "white", alpha = 0.85) +
+  labs(title = "Distribution of Survival Time",
+       x = "Survival Time (days)", y = "Count") +
+  theme_light(base_size = 13)
+```
+
+The distribution of survival time is strongly left-skewed, with most fish surviving to or near the maximum follow-up period. This is expected given substantial right-censoring: 28 of 90 fish (31%) were still alive at last observation (`death2 = No`).
+
+### Categorical Variables
+
+```{r cat-counts}
+sp_tbl <- trout_clean %>% count(species) %>%
+  mutate(Proportion = round(n / sum(n), 3)) %>%
+  rename(Species = species, Count = n)
+
+st_tbl <- trout_clean %>% count(stream) %>%
+  mutate(Proportion = round(n / sum(n), 3)) %>%
+  rename(Stream = stream, Count = n)
+
+or_tbl <- trout_clean %>% count(order) %>%
+  mutate(Proportion = round(n / sum(n), 3)) %>%
+  rename(Order = order, Count = n)
+
+ev_tbl <- trout_clean %>% count(death2) %>%
+  mutate(Proportion = round(n / sum(n), 3)) %>%
+  rename(Died = death2, Count = n)
+
+kable(sp_tbl, caption = "Species Distribution") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+kable(st_tbl, caption = "Stream Distribution") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+kable(or_tbl, caption = "Stream Order Distribution") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+kable(ev_tbl, caption = "Event (Death) Distribution") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+The sample is roughly balanced between Brook and Brown Trout and distributed across five streams. Stream order is dominated by medium-order streams (60%). Of the 90 fish in the cleaned dataset, 62 (68.9%) experienced the event (death or loss).
+
+```{r cat-boxplots, fig.width=10, fig.height=4}
+cat_species <- ggplot(trout_clean, aes(x = species, y = time2, fill = species)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 16) +
+  scale_fill_manual(values = c("#4dac26", "#d01c8b")) +
+  labs(title = "Survival Time by Species", x = "Species", y = "Survival Time (days)") +
+  theme_light(base_size = 12) + theme(legend.position = "none")
+
+cat_order <- ggplot(trout_clean, aes(x = order, y = time2, fill = order)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 16) +
+  scale_fill_manual(values = c("#fdae61", "#abd9e9", "#2c7bb6")) +
+  labs(title = "Survival Time by Stream Order", x = "Stream Order",
+       y = "Survival Time (days)") +
+  theme_light(base_size = 12) + theme(legend.position = "none")
+
+grid.arrange(cat_species, cat_order, ncol = 2)
+```
+
+```{r cat-boxplot-stream, fig.width=8, fig.height=4}
+cat_stream <- ggplot(trout_clean, aes(x = stream, y = time2, fill = stream)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 16) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Survival Time by Stream", x = "Stream", y = "Survival Time (days)") +
+  theme_light(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "none")
+
+cat_stream
+```
+
+Brook and Brown Trout show similar median survival times with overlapping distributions. Fish in low-order streams appear to have shorter survival times, while medium-order streams show the widest variability.
+
+### Quantitative Variables
+
+```{r quant-summary}
+summary(trout_clean[, c("Lgt", "Wgt", "cumdrain", "move_rate")])
+```
+
+```{r quant-hists, fig.width=10, fig.height=9}
+h1 <- ggplot(trout_clean, aes(x = Lgt)) +
+  geom_histogram(bins = 18, fill = "#74add1", color = "white") +
+  labs(title = "Fish Length (mm)", x = "Length (mm)", y = "Count") + theme_light()
+
+h2 <- ggplot(trout_clean, aes(x = Wgt)) +
+  geom_histogram(bins = 18, fill = "#f46d43", color = "white") +
+  labs(title = "Fish Weight (g) — Raw", x = "Weight (g)", y = "Count") + theme_light()
+
+h3 <- ggplot(trout_clean, aes(x = log_Wgt)) +
+  geom_histogram(bins = 18, fill = "#fdae61", color = "white") +
+  labs(title = "Fish Weight — Log Transformed", x = "log(Weight)", y = "Count") +
+  theme_light()
+
+h4 <- ggplot(trout_clean, aes(x = cumdrain)) +
+  geom_histogram(bins = 18, fill = "#4dac26", color = "white") +
+  labs(title = "Cumulative Drainage (km²)", x = "cumdrain", y = "Count") + theme_light()
+
+h5 <- ggplot(trout_clean, aes(x = move_rate)) +
+  geom_histogram(bins = 18, fill = "#762a83", color = "white") +
+  labs(title = "Movement Rate (m/day) — Raw", x = "move_rate", y = "Count") + theme_light()
+
+h6 <- ggplot(trout_clean, aes(x = log_move_rate)) +
+  geom_histogram(bins = 18, fill = "#c2a5cf", color = "white") +
+  labs(title = "Movement Rate — Log Transformed", x = "log(move_rate)", y = "Count") +
+  theme_light()
+
+grid.arrange(h1, h2, h3, h4, h5, h6, ncol = 2)
+```
+
+Both `Wgt` and `move_rate` are heavily right-skewed. Log transformations substantially increase symmetry and are used in Cox regression. `Lgt` is approximately normally distributed. `cumdrain` shows a bimodal shape reflecting stream-level clustering of catchment sizes.
+
+---
+
+## IV. Analysis
+
+### Kaplan-Meier Survival Curve & Log-Rank Test
+
+We compared survival between Brook and Brown Trout using the Kaplan-Meier estimator and a log-rank test.
+
+```{r km-fit}
+surv_obj <- Surv(time = trout_clean$time2, event = trout_clean$event)
+km_fit   <- survfit(Surv(time2, event) ~ species, data = trout_clean)
+print(summary(km_fit), digits = 4)
+```
+
+```{r km-plot, fig.width=8, fig.height=6}
+ggsurvplot(km_fit,
+           data        = trout_clean,
+           pval        = TRUE,
+           risk.table  = TRUE,
+           palette     = c("red", "#2E9FDF"),
+           legend.labs = c("Brook", "Brown"),
+           title       = "Survival by Trout Species")
+```
+
+```{r log-rank}
+surv_diff <- survdiff(surv_obj ~ species, data = trout_clean)
+surv_diff
+```
+
+**Hypotheses:**
+
+- $H_0$: There is no difference in survival time between Brook and Brown Trout
+- $H_A$: There is a difference in survival time between Brook and Brown Trout
+
+**Conclusion:** With p = 0.5 > α = 0.05, we fail to reject the null hypothesis. There is no statistically significant difference in survival between species based on the log-rank test alone. We proceed to Cox regression to evaluate species alongside other covariates while adjusting for potential confounders.
+
+---
+
+### Cox Proportional Hazards Regression
+
+#### Model Building & Selection
+
+We begin with a full model and sequentially remove variables based on collinearity findings and significance.
+
+**Model 1 — Full model (includes both `stream` and `order`):**
+
+```{r model1}
+model1 <- coxph(surv_obj ~ species + Lgt + Wgt + stream + order +
+                  cumdrain + move_rate, data = trout_clean)
+summary(model1)
+```
+
+```{r collinearity-check}
+# Confirm perfect collinearity between stream and order
+table(trout_clean$order, trout_clean$stream)
+```
+
+`stream` and `order` are perfectly collinear — each stream belongs to exactly one order level — causing rank-deficiency. One must be dropped.
+
+**Model 2 — Drop `order`, keep `stream`:**
+
+```{r model2}
+model2 <- coxph(surv_obj ~ species + Lgt + Wgt + stream +
+                  cumdrain + move_rate, data = trout_clean)
+summary(model2)
+```
+
+Model 2 produces `NA` estimates for `cumdrain` due to additional collinearity between `cumdrain` and the stream dummy variables. This model is not usable.
+
+**Model 3 — Drop `stream`, keep `order`; use log-transformed predictors; exclude `Lgt`:**
+
+```{r model3}
+model3 <- coxph(surv_obj ~ species + log_Wgt + order +
+                  cumdrain + log_move_rate, data = trout_clean)
+summary(model3)
+```
+
+#### Model Comparison by AIC
+
+```{r aic-comparison}
+AIC(model1, model2, model3)
+```
+
+Model 3 resolves all collinearity issues and is our **final model**. `log_Wgt` replaces raw `Wgt` for better linearity on the log-hazard scale, `Lgt` is excluded due to its near-perfect correlation with weight (r = 0.90), and `log_move_rate` is used given the right skew of the raw movement variable. AIC confirms Model 3 as the correct choice (AIC = 505.87, Δ AIC = 6.93 vs. M1/M2).
+
+---
+
+## V. Key Findings
+
+Among all predictors in the final model (Model 3), only **movement rate** was statistically significant (HR = 0.793, p = 0.032), indicating that increased movement is associated with reduced hazard and improved survival. For a one-unit increase in log(move_rate), the hazard decreases by approximately 21% (1 − 0.793), holding all other variables constant. This may reflect that more active fish are better able to avoid predators or occupy more favorable habitats.
+
+Brown trout had HR = 0.70 (30% lower hazard than Brook trout), but this was not statistically significant. The `order` variable was also non-significant (HR = 0.56 for medium; HR = 0.11 for complex — the latter with very wide CIs). `cumdrain` was non-significant (HR = 1.03). The overall model was not statistically significant (likelihood ratio test p = 0.40), and concordance was moderate (C = 0.60).
+
+---
+
+## VI. Model Assumptions
+
+### Proportional Hazards
+
+- $H_0$: The log hazard ratio for each predictor is constant over time
+- $H_A$: The log hazard ratio changes over time
+
+```{r ph-test}
+ph_test <- cox.zph(model3)
+print(ph_test)
+```
+
+```{r ph-plot, fig.width=10, fig.height=8}
+ggcoxzph(ph_test)
+```
+
+The proportional hazards assumption is **violated for most predictors** in Model 3. The variables `species`, `order`, `cumdrain`, and `log_move_rate` all have p-values below 0.05, indicating their log hazard ratios are not constant over time. The global test is highly significant (p = 6.5 × 10⁻⁵).
+
+**Correction:** Future studies should include time-varying covariates (time × predictor interactions) to better model effects that change over the study period. A stratified Cox model — allowing each group (e.g., species, stream order) to have its own baseline hazard function while retaining shared coefficient estimates — is a recommended alternative.
+
+### Linearity (Martingale Residuals)
+
+```{r linearity, fig.width=7, fig.height=9}
+Y  <- resid(model3, type = "martingale")
+x1 <- trout_clean$log_Wgt
+x2 <- trout_clean$cumdrain
+x3 <- trout_clean$log_move_rate
+
+par(mfrow = c(3, 1))
+
+# Log Weight
+plot(Y ~ x1, pch = 20, col = "darkgrey",
+     ylab = "Martingale Residual", xlab = "log(Weight)",
+     main = "Log Weight: Residuals vs. Predictor")
+abline(h = 0)
+lines(smooth.spline(Y ~ x1, df = 6), lty = 2, lwd = 2)
+
+# Cumdrain
+plot(Y ~ x2, pch = 20, col = "darkgrey",
+     ylab = "Martingale Residual", xlab = "cumdrain",
+     main = "Cumulative Drainage: Residuals vs. Predictor")
+abline(h = 0)
+lines(smooth.spline(Y ~ x2, df = 6), lty = 2, lwd = 2)
+
+# Log Move Rate
+plot(Y ~ x3, pch = 20, col = "darkgrey",
+     ylab = "Martingale Residual", xlab = "log(move_rate)",
+     main = "Log Move Rate: Residuals vs. Predictor")
+abline(h = 0)
+lines(smooth.spline(Y ~ x3, df = 6), lty = 2, lwd = 2)
+```
+
+For `log_Wgt`, the smoothed spline remains close to zero — linearity is reasonably satisfied. For `cumdrain`, the spline is flat at zero — linearity is satisfied. For `log_move_rate`, there is a slight curve, indicating a mild departure, but this is considered approximately satisfied given the log transformation already applied.
+
+### Outliers (Martingale and Deviance Residuals)
+
+```{r outliers, fig.width=10, fig.height=4}
+par(mfrow = c(1, 2))
+
+plot(resid(model3, type = "martingale"),
+     ylab = "Martingale residual", xlab = "Observation",
+     main = "Martingale Residuals", pch = 20, col = "darkgrey")
+abline(h = 0, lty = 2)
+
+plot(resid(model3, type = "deviance"),
+     ylab = "Deviance residual", xlab = "Observation",
+     main = "Deviance Residuals", pch = 20, col = "darkgrey")
+abline(h = c(-2, 2), lty = 2, col = "red")
+```
+
+Martingale residuals range from approximately −2.0 to 1.0, with a few observations below −1.5. No single observation constitutes an extreme outlier. In the deviance residuals plot, most observations fall between −2 and 2, with one observation near 3.0 — worth noting, but not severe enough to harm model estimates.
+
+### Independence
+
+Since each fish is an individually tagged animal, the independence assumption is satisfied.
+
+### Multicollinearity
+
+```{r multicollinearity}
+# Correlation matrix for final model continuous predictors
+cont_vars <- trout_clean[, c("log_Wgt", "cumdrain", "log_move_rate")]
+cor(cont_vars)
+```
+
+```{r pairs-plot, fig.width=6, fig.height=6}
+pairs(trout_clean[, c("log_Wgt", "cumdrain", "log_move_rate")],
+      main = "Scatterplot Matrix of Continuous Predictors",
+      pch = 20, col = "darkgrey")
+```
+
+The correlation matrix indicates low pairwise correlations among all three continuous predictors. `log_Wgt` and `cumdrain` have the highest correlation (r ≈ 0.34). No evidence of multicollinearity among the predictors included in the final model.
+
+---
+
+## VII. Limitations
+
+1. **Proportional hazards violations:** Hazard ratios are non-constant over time for most predictors (global Schoenfeld p = 6.5 × 10⁻⁵). Standard Cox estimates should be interpreted as average effects. Time-varying or stratified extensions are recommended for future work.
+2. **Missing movement data:** Nine fish were excluded due to missing `move_rate`. If missingness is related to fish condition or mortality risk, the sample may not be fully representative, introducing selection bias.
+3. **Aggregation across streams:** Retaining `order` across streams may obscure stream-specific survival effects.
+4. **Overall model fit:** The likelihood ratio test was not significant (χ² = 6.65, df = 6, p = 0.40), suggesting limited predictive ability. Sample size (n = 90; 62 events) is moderate for ecological survival analysis.
+
+---
+
+## VIII. Conclusion
+
+Using Kaplan-Meier estimation and Cox proportional hazards regression, we analyzed 90 Brook and Brown Trout across five Pennsylvania streams over a 153-day observation period. The Kaplan-Meier log-rank test found no statistically significant difference in survival between species (χ² = 0.5, p = 0.5).
+
+In the final Cox model (Model 3), log movement rate was the only statistically significant predictor (HR = 0.793, p = 0.032): more active fish exhibited a reduced hazard of death, possibly reflecting better habitat access or predator avoidance. Species, weight, stream order, and cumulative drainage were not statistically significant.
+
+Future research should expand sample sizes — particularly in underrepresented stream order categories — and employ time-varying coefficient models to address the identified proportional hazards violations.
+
+---
+
+## IX. Data Source
+
+U.S. Fish and Wildlife Service. "Brook and Brown Trout Survival in a North-Central Pennsylvania Watershed." Data.gov, 2023. [catalog.data.gov](https://catalog.data.gov/dataset/brook-and-brown-trout-survival-in-a-north-central-pennsylvania-watershed)
